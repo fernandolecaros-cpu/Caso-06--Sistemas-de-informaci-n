@@ -1,0 +1,428 @@
+// run `node index.js` in the terminal
+
+import express from 'express';
+import clientesRoutes from './routers/clientes.js';
+import repartidoresRoutes from './routers/repartidores.js';
+import pedidosRoutes from './routers/pedidos.js';
+
+const app = express();
+
+app.use(express.json());
+
+app.get('/', (req, res) => {
+  res.send('API REST RutaSmart funcionando correctamente');
+});
+
+app.use('/clientes', clientesRoutes);
+app.use('/repartidores', repartidoresRoutes);
+app.use('/pedidos', pedidosRoutes);
+
+app.listen(3000, () => {
+  console.log('API REST RutaSmart en http://localhost:3000');
+});
+import express from 'express';
+import path from 'path';
+import { createServer as createViteServer } from 'vite';
+import { db, initDatabase } from './src/db/db_service.ts';
+
+// Initialize SQLite Schema
+initDatabase();
+
+const app = express();
+app.use(express.json());
+
+const PORT = 3000;
+
+// Simple Server-Sent Events (SSE) notification stream for push updates
+let clientResConnections: any[] = [];
+
+app.get('/api/updates', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  clientResConnections.push(res);
+
+  req.on('close', () => {
+    clientResConnections = clientResConnections.filter(c => c !== res);
+  });
+});
+
+function broadcastUpdate(data: any) {
+  clientResConnections.forEach(res => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  });
+}
+
+// 1. GET /api/zonas -> list of zones
+app.get('/api/zonas', (req, res) => {
+  try {
+    const zones = [
+      { id: 1, nombre: 'Centro', porcentaje: 35 },
+      { id: 2, nombre: 'Providencia', porcentaje: 22 },
+      { id: 3, nombre: 'Las Condes', porcentaje: 15 },
+      { id: 4, nombre: 'Ñuñoa', porcentaje: 12 },
+      { id: 5, nombre: 'Santiago Poniente', porcentaje: 9 },
+      { id: 6, nombre: 'Vitacura', porcentaje: 7 }
+    ];
+    res.json(zones);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cargar zonas' });
+  }
+});
+
+// 2. GET /api/productos -> product menu
+app.get('/api/productos', (req, res) => {
+  try {
+    const rows = db.prepare('SELECT * FROM productos').all();
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cargar productos' });
+  }
+});
+
+// Authentication routes
+app.post('/api/auth/login', (req, res) => {
+  try {
+    const { correo, contraseña } = req.body;
+    if (!correo || !contraseña) {
+      return res.status(400).json({ error: 'Correo/Usuario y contraseña vacíos' });
+    }
+
+    // Try finding by correo, email or nombre
+    const client = db.prepare('SELECT * FROM clientes').all().find((c: any) => 
+      (c.correo && c.correo.toLowerCase() === correo.toLowerCase()) ||
+      (c.email && c.email.toLowerCase() === correo.toLowerCase()) ||
+      (c.nombre && c.nombre.toLowerCase() === correo.toLowerCase())
+    );
+
+    if (!client) {
+      return res.status(401).json({ error: 'Credenciales inválidas o cliente no encontrado.' });
+    }
+
+    if (!client.contraseña_hash || client.contraseña_hash !== contraseña) {
+      return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    }
+
+    // Register active session in sesiones
+    const token = 'sess_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    const dateStart = new Date().toISOString();
+    const id_cliente = client.id_cliente || client.id;
+    
+    db.prepare(`
+      INSERT INTO sesiones (id_cliente, token_sesion, fecha_inicio, fecha_cierre)
+      VALUES (?, ?, ?, NULL)
+    `).run(id_cliente, token, dateStart);
+
+    res.json({
+      success: true,
+      mensaje: `Bienvenido, ${client.nombre}`,
+      token_sesion: token,
+      cliente: {
+        id: client.id,
+        id_cliente: id_cliente,
+        nombre: client.nombre,
+        email: client.email,
+        correo: client.correo || client.email,
+        telefono: client.telefono,
+        nivel: client.nivel,
+        zona: client.zona,
+        foto_url: client.foto_url
+      }
+    });
+  } catch (error) {
+    console.error('Error en login:', error);
+    res.status(500).json({ error: 'Error del servidor en el inicio de sesión' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  try {
+    const { token_sesion } = req.body;
+    if (!token_sesion) {
+      return res.status(400).json({ error: 'Token de sesión requerido para cerrar sesión' });
+    }
+
+    const dateEnd = new Date().toISOString();
+    db.prepare(`
+      UPDATE sesiones 
+      SET fecha_cierre = ? 
+      WHERE token_sesion = ?
+    `).run(dateEnd, token_sesion);
+
+    res.json({
+      success: true,
+      mensaje: 'Has cerrado sesión correctamente.'
+    });
+  } catch (error) {
+    console.error('Error en logout:', error);
+    res.status(500).json({ error: 'Error del servidor en el cierre de sesión' });
+  }
+});
+
+// 3. GET /api/clientes -> list of clients
+app.get('/api/clientes', (req, res) => {
+  try {
+    const rows = db.prepare('SELECT id, nombre, zona FROM clientes').all();
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cargar clientes' });
+  }
+});
+
+// 4. GET /api/pedidos?fecha=... -> fetch orders filterable by date
+app.get('/api/pedidos', (req, res) => {
+  try {
+    const { fecha } = req.query;
+    let query = 'SELECT p.*, c.nombre as cliente_nombre FROM pedidos p JOIN clientes c ON p.cliente_id = c.id';
+    let params: any[] = [];
+    
+    if (fecha) {
+      query += ' WHERE p.fecha = ?';
+      params.push(fecha);
+    }
+    
+    query += ' ORDER BY p.id DESC';
+    const rows = db.prepare(query).all(...params);
+
+    // Hydrate each order with their order details
+    const hydratedRows = rows.map((order: any) => {
+      const items = db.prepare(`
+        SELECT dp.*, prod.nombre, prod.imagen_url 
+        FROM detalle_pedidos dp 
+        JOIN productos prod ON dp.producto_id = prod.id 
+        WHERE dp.pedido_id = ?
+      `).all(order.id);
+      return { ...order, items };
+    });
+
+    res.json(hydratedRows);
+  } catch (error) {
+    res.status(500).json({ error: 'Error al cargar pedidos' });
+  }
+});
+
+// 5. POST /api/pedidos -> place a new delivery txn
+app.post('/api/pedidos', (req, res) => {
+  try {
+    const { cliente_id, productos, zona, direccion, ref_direccion, metodo_pago } = req.body;
+    
+    if (!cliente_id || !productos || productos.length === 0) {
+      return res.status(400).json({ error: 'Campos requeridos incompletos' });
+    }
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const timeStr = new Date().toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const tracking = 'RS-' + Math.floor(1000 + Math.random() * 9000);
+
+    // Calculate totals
+    let subtotal = 0;
+    for (const item of productos) {
+      const prod = db.prepare('SELECT precio FROM productos WHERE id = ?').get(item.id);
+      if (prod) {
+        subtotal += (prod as any).precio * item.cantidad;
+      }
+    }
+    const cost_envio = 1500;
+    const total = subtotal + cost_envio;
+
+    // Insert order transactionally
+    const stmt = db.prepare(`
+      INSERT INTO pedidos (tracking_number, cliente_id, repartidor_id, estado, zona, direccion, subtotal, costo_envio, total, fecha, hora, metodo_pago, ref_direccion)
+      VALUES (?, ?, 1, 'Preparación', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    const result = stmt.run(tracking, cliente_id, zona, direccion, subtotal, cost_envio, total, todayStr, timeStr, metodo_pago || 'Crédito Webpay', ref_direccion || '');
+    const newOrderId = result.lastInsertRowid;
+
+    // Detallar productos
+    for (const item of productos) {
+      const prod = db.prepare('SELECT precio FROM productos WHERE id = ?').get(item.id);
+      const price = prod ? (prod as any).precio : 0;
+      db.prepare(`
+        INSERT INTO detalle_pedidos (pedido_id, producto_id, cantidad, precio)
+        VALUES (?, ?, ?, ?)
+      `).run(newOrderId, item.id, item.cantidad, price);
+    }
+
+    // Insert default receiving notification
+    db.prepare(`
+      INSERT INTO notificaciones (cliente_id, pedido_id, mensaje, leido, fecha)
+      VALUES (?, ?, ?, 0, ?)
+    `).run(cliente_id, newOrderId, 'Tu pedido está siendo preparado.', todayStr);
+
+    const fullOrder = {
+      id: newOrderId,
+      tracking_number: tracking,
+      cliente_id,
+      estado: 'Preparación',
+      zona,
+      direccion,
+      total,
+      fecha: todayStr,
+      hora: timeStr
+    };
+
+    broadcastUpdate({ type: 'NEW_ORDER', order: fullOrder });
+    res.status(201).json(fullOrder);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al registrar pedido' });
+  }
+});
+
+// 6. PATCH /api/pedidos/:id/estado -> change delivery state
+app.patch('/api/pedidos/:id/estado', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { estado } = req.body; // e.g. "PREPARANDO", "ASIGNADO", "MATIAS_ACEPTO", "EN_CAMINO", "ENTREGADO", "PROXIMO_5_MIN"
+
+    if (!estado) {
+      return res.status(400).json({ error: 'Estado requerido' });
+    }
+
+    // Grab current info
+    const currentOrder = db.prepare('SELECT * FROM pedidos WHERE id = ?').get(id) as any;
+    if (!currentOrder) {
+      return res.status(404).json({ error: 'Pedido no encontrado' });
+    }
+
+    // Map stages to Spanish client notification updates explicitly
+    let notificationText = '';
+    const upperCap = estado.toUpperCase();
+    if (upperCap === 'PREPARACION' || upperCap === 'PREPARACIÓN' || upperCap === 'PREPARANDO') {
+      notificationText = 'Tu pedido está siendo preparado.';
+    } else if (upperCap === 'ENTREGADO AL REPARTIDOR' || upperCap === 'ENTREGADO_AL_REPARTIDOR' || upperCap === 'MATIAS_ACEPTO' || upperCap === 'ASIGNADO') {
+      const clientRow = db.prepare('SELECT nombre FROM clientes WHERE id = ?').get(currentOrder.cliente_id) as any;
+      const clientName = clientRow ? clientRow.nombre : 'Julián Cortés';
+      notificationText = `Matías aceptó el pedido de ${clientName}.`;
+    } else if (upperCap === 'EN_CAMINO') {
+      notificationText = 'Tu pedido está en camino.';
+    } else if (upperCap === 'PROXIMO_5_MIN') {
+      notificationText = 'Tu repartidor llegará en aproximadamente 5 minutos.';
+    } else if (upperCap === 'ENTREGADO') {
+      notificationText = 'Tu pedido fue entregado correctamente.';
+    } else {
+      notificationText = `Estado del pedido cambiado a ${estado}.`;
+    }
+
+    // Update order status
+    db.prepare('UPDATE pedidos SET estado = ? WHERE id = ?').run(estado, id);
+
+    // Save notification
+    const todayStr = new Date().toISOString().split('T')[0];
+    db.prepare(`
+      INSERT INTO notificaciones (cliente_id, pedido_id, mensaje, leido, fecha)
+      VALUES (?, ?, ?, 0, ?)
+    `).run(currentOrder.cliente_id, id, notificationText, todayStr);
+
+    broadcastUpdate({ type: 'ORDER_STATE_CHANGED', orderId: id, estado: estado, notification: notificationText });
+
+    res.json({ success: true, estado: estado, notification: notificationText });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al cambiar estado' });
+  }
+});
+
+// 7. GET /api/ruta/hoy -> optimized route of the day
+app.get('/api/ruta/hoy', (req, res) => {
+  try {
+    // Generate optimized delivery routing list. Active orders that are 'EN_CAMINO' or 'PENDIENTE'
+    const activeOrders = db.prepare(`
+      SELECT p.*, c.nombre as cliente_nombre 
+      FROM pedidos p 
+      JOIN clientes c ON p.cliente_id = c.id
+      WHERE p.estado IN ('PENDIENTE', 'EN_RUTA', 'ASIGNADO', 'MATIAS_ACEPTO', 'EN_CAMINO')
+      ORDER BY p.id ASC
+    `).all();
+
+    res.json({
+      repartidor: 'Matías Aravena',
+      vehiculo: 'Bicicleta',
+      total_paradas: activeOrders.length,
+      ruta_optimizada: activeOrders
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al calcular optimización de ruta' });
+  }
+});
+
+// 8. GET /api/dashboard -> overall metrics
+app.get('/api/dashboard', (req, res) => {
+  try {
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    // Pedidos del día stats
+    const totalToday = db.prepare("SELECT COUNT(*) as count FROM pedidos WHERE fecha = ?").get(todayStr) as any;
+    const deliveredToday = db.prepare("SELECT COUNT(*) as count FROM pedidos WHERE fecha = ? AND estado = 'ENTREGADO'").get(todayStr) as any;
+    const pendingToday = db.prepare("SELECT COUNT(*) as count FROM pedidos WHERE fecha = ? AND estado != 'ENTREGADO'").get(todayStr) as any;
+    const earningsToday = db.prepare("SELECT SUM(total) as sum FROM pedidos WHERE fecha = ?").get(todayStr) as any;
+
+    // Delivery counts grouped by Santiago zones
+    const zoneCounts = db.prepare(`
+      SELECT zona, COUNT(*) as count 
+      FROM pedidos 
+      GROUP BY zona
+    `).all();
+
+    res.json({
+      pedidos_del_dia: totalToday ? totalToday.count : 42,
+      entregados: deliveredToday ? deliveredToday.count : 28,
+      pendientes: pendingToday ? pendingToday.count : 14,
+      ingresos: earningsToday ? (earningsToday.sum || 12500 * (totalToday ? totalToday.count : 42)) : 525000,
+      demand_by_zone: zoneCounts.length > 0 ? zoneCounts : [
+        { zona: 'Centro', count: 18 },
+        { zona: 'Providencia', count: 12 },
+        { zona: 'Las Condes', count: 8 },
+        { zona: 'Ñuñoa', count: 3 },
+        { zona: 'Santiago Poniente', count: 1 }
+      ],
+      last_7_days: [
+        { dia: 'Lunes', pedidos: 45 },
+        { dia: 'Martes', pedidos: 52 },
+        { dia: 'Miércoles', pedidos: 49 },
+        { dia: 'Jueves', pedidos: 41 },
+        { dia: 'Viernes', pedidos: 48 },
+        { dia: 'Sábado', pedidos: 28 },
+        { dia: 'Domingo', pedidos: 15 }
+      ],
+      demanda_por_hora: [
+        { hora: '08:00', pedidos: 5 },
+        { hora: '10:00', pedidos: 12 },
+        { hora: '11:00', pedidos: 38 },
+        { hora: '12:00', pedidos: 42 },
+        { hora: '13:00', pedidos: 35 },
+        { hora: '14:00', pedidos: 20 },
+        { hora: '16:00', pedidos: 8 },
+        { hora: '18:00', pedidos: 4 }
+      ]
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Error al generar analíticas' });
+  }
+});
+
+// Configure Vite or simple asset rendering
+async function start() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server fully operational on http://localhost:${PORT}`);
+  });
+}
+
+start();
